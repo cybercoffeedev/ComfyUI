@@ -1,0 +1,17 @@
+services:
+  comfyui:
+    image: comfyui-comfyui
+    container_name: comfyui
+    ports:
+      - 127.0.0.1:8188:8188
+    volumes:
+      - "./models:/ComfyUI/models"
+      - "./output:/ComfyUI/output"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
