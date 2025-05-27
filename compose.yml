@@ -3,8 +3,8 @@ x-comfyui-base: &comfyui-base
   ports:
     - 8188:8188
   volumes:
-    - ./models:/ComfyUI/models
-    - ./output:/ComfyUI/output
+    - ./models:/app/models
+    - ./output:/app/output
   restart: unless-stopped
 
 services:
