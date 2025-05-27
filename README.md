@@ -307,6 +307,13 @@ You can enable experimental memory efficient attention on recent pytorch in Comf
 
 You can also try setting this env variable `PYTORCH_TUNABLEOP_ENABLED=1` which might speed things up at the cost of a very slow initial run.
 
+# Running with Docker
+### Currently only NVIDIA CUDA and CPU profiles are supported by provided Docker configuration
+
+Run the ```docker compose --profile <profile> up``` with profile:
+   * ```base``` for CPU only
+   * ```cuda``` for NVIDIA CUDA device
+
 # Notes
 
 Only parts of the graph that have an output with all the correct inputs will be executed.
