@@ -1,17 +1,45 @@
-FROM nvidia/cuda:12.2.2-base-ubuntu22.04
-ENV DEBIAN_FRONTEND=noninteractive
+# Base image
+FROM ubuntu:24.04 AS base
 
-WORKDIR /ComfyUI
+# Install system dependencies
+RUN apt update && apt install -y --no-install-recommends \
+    software-properties-common && add-apt-repository ppa:deadsnakes/ppa && \
+    apt update && apt install -y --no-install-recommends \
+    python3.12 \
+    python3-pip \
+    git && \
+    rm -rf /var/lib/apt/lists/*
+    
+WORKDIR /app
 COPY . .
 
-RUN apt update && apt install -y software-properties-common && \
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    apt update && apt install -y python3.12 python3.12-venv python3-pip
+# Install dependencies with PIP
+RUN pip install --no-cache-dir torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cpu --break-system-packages \
+    && pip install --no-cache-dir -r requirements.txt --break-system-packages
 
-RUN python3.12 -m venv /ComfyUI/venv && \
-    /ComfyUI/venv/bin/pip install --upgrade pip && \
-    /ComfyUI/venv/bin/pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 && \
-    /ComfyUI/venv/bin/pip install -r requirements.txt
+# Default entrypoint
+ENTRYPOINT ["python3.12", "main.py", "--listen", "--cpu"]
 
-ENV PATH="/ComfyUI/venv/bin:$PATH"
-CMD ["python", "main.py", "--listen"]
+# CUDA image
+FROM nvidia/cuda:12.9.0-base-ubuntu24.04 AS cuda
+
+# Install system dependencies
+RUN apt update && apt install -y --no-install-recommends \
+    software-properties-common && add-apt-repository ppa:deadsnakes/ppa && \
+    apt update && apt install -y --no-install-recommends \
+    python3.12 \
+    python3-pip \
+    git && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+# Install dependencies with PIP
+RUN pip install --no-cache-dir torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128 --break-system-packages \
+    && pip install --no-cache-dir -r requirements.txt --break-system-packages
+
+# Default entrypoint
+ENTRYPOINT ["python3.12", "main.py", "--listen"]

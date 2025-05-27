@@ -1,12 +1,28 @@
+x-comfyui-base: &comfyui-base
+  container_name: ComfyUI
+  ports:
+    - 8188:8188
+  volumes:
+    - ./models:/ComfyUI/models
+    - ./output:/ComfyUI/output
+  restart: unless-stopped
+
 services:
-  comfyui:
-    image: comfyui-comfyui
-    container_name: comfyui
-    ports:
-      - 127.0.0.1:8188:8188
-    volumes:
-      - "./models:/ComfyUI/models"
-      - "./output:/ComfyUI/output"
+  # Base (CPU-only) configuration
+  comfyui-base:
+    <<: *comfyui-base
+    build:
+      target: base
+    image: local/comfyui:latest
+    profiles:
+      - base
+
+  # CUDA (NVIDIA GPU-enabled) configuration
+  comfyui-cuda:
+    <<: *comfyui-base
+    build:
+      target: cuda
+    image: local/comfyui:cuda
     deploy:
       resources:
         reservations:
@@ -14,4 +30,5 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    restart: unless-stopped
+    profiles:
+      - cuda
