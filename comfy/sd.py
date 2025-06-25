@@ -1081,7 +1081,28 @@ def load_state_dict_guess_config(sd, output_vae=True, output_clip=True, output_c
     return (model_patcher, clip, vae, clipvision)
 
 
-def load_diffusion_model_state_dict(sd, model_options={}): #load unet in diffusers or regular format
+def load_diffusion_model_state_dict(sd, model_options={}):
+    """
+    Loads a UNet diffusion model from a state dictionary, supporting both diffusers and regular formats.
+
+    Args:
+        sd (dict): State dictionary containing model weights and configuration
+        model_options (dict, optional): Additional options for model loading. Supports:
+            - dtype: Override model data type
+            - custom_operations: Custom model operations
+            - fp8_optimizations: Enable FP8 optimizations
+
+    Returns:
+        ModelPatcher: A wrapped model instance that handles device management and weight loading.
+        Returns None if the model configuration cannot be detected.
+
+    The function:
+    1. Detects and handles different model formats (regular, diffusers, mmdit)
+    2. Configures model dtype based on parameters and device capabilities
+    3. Handles weight conversion and device placement
+    4. Manages model optimization settings
+    5. Loads weights and returns a device-managed model instance
+    """
     dtype = model_options.get("dtype", None)
 
     #Allow loading unets from checkpoint files
@@ -1139,7 +1160,7 @@ def load_diffusion_model_state_dict(sd, model_options={}): #load unet in diffuse
     model.load_model_weights(new_sd, "")
     left_over = sd.keys()
     if len(left_over) > 0:
-        logging.info("left over keys in unet: {}".format(left_over))
+        logging.info("left over keys in diffusion model: {}".format(left_over))
     return comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
 
 
@@ -1147,7 +1168,7 @@ def load_diffusion_model(unet_path, model_options={}):
     sd = comfy.utils.load_torch_file(unet_path)
     model = load_diffusion_model_state_dict(sd, model_options=model_options)
     if model is None:
-        logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
+        logging.error("ERROR UNSUPPORTED DIFFUSION MODEL {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
     return model
 
