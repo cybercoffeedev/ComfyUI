@@ -1,0 +1,33 @@
+x-comfyui-base: &comfyui-base
+  container_name: ComfyUI
+  ports:
+    - 8188:8188
+  volumes:
+    - ./models:/app/models
+    - ./output:/app/output
+  restart: unless-stopped
+
+services:
+  # CPU-only configuration
+  comfyui-cpu:
+    <<: *comfyui-base
+    build:
+      args:
+        - IMAGE=cpu    
+    profiles:
+      - cpu
+  # CUDA (NVIDIA GPUs) configuration
+  comfyui-cuda:
+    <<: *comfyui-base
+    build:
+      args:
+        - IMAGE=cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    profiles:
+      - cuda
