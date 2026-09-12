@@ -17,17 +17,18 @@ if TYPE_CHECKING:
     from spandrel import ImageModelDescriptor
     from comfy.clip_vision import ClipVisionModel
     from comfy.clip_vision import Output as ClipVisionOutput_
+    from comfy.bg_removal_model import BackgroundRemovalModel
     from comfy.controlnet import ControlNet
     from comfy.hooks import HookGroup, HookKeyframeGroup
     from comfy.model_patcher import ModelPatcher
     from comfy.samplers import CFGGuider, Sampler
     from comfy.sd import CLIP, VAE
     from comfy.sd import StyleModel as StyleModel_
-    from comfy_api.input import VideoInput
+    from comfy_api.input import VideoInput, CurveInput as CurveInput_
 from comfy_api.internal import (_ComfyNodeInternal, _NodeOutputInternal, classproperty, copy_class, first_real_override, is_class,
     prune_dict, shallow_clone_class)
 from comfy_execution.graph_utils import ExecutionBlocker
-from ._util import MESH, VOXEL, SVG as _SVG
+from ._util import MESH, VOXEL, SPLAT, SVG as _SVG, File3D
 
 
 class FolderType(str, Enum):
@@ -73,7 +74,14 @@ class RemoteOptions:
 class NumberDisplay(str, Enum):
     number = "number"
     slider = "slider"
+    gradient_slider = "gradientslider"
 
+
+class ControlAfterGenerate(str, Enum):
+    fixed = "fixed"
+    increment = "increment"
+    decrement = "decrement"
+    randomize = "randomize"
 
 class _ComfyType(ABC):
     Type = Any
@@ -263,7 +271,7 @@ class Int(ComfyTypeIO):
     class Input(WidgetInput):
         '''Integer input.'''
         def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None, lazy: bool=None,
-                    default: int=None, min: int=None, max: int=None, step: int=None, control_after_generate: bool=None,
+                    default: int=None, min: int=None, max: int=None, step: int=None, control_after_generate: bool | ControlAfterGenerate=None,
                     display_mode: NumberDisplay=None, socketless: bool=None, force_input: bool=None, extra_dict=None, raw_link: bool=None, advanced: bool=None):
             super().__init__(id, display_name, optional, tooltip, lazy, default, socketless, None, force_input, extra_dict, raw_link, advanced)
             self.min = min
@@ -290,13 +298,15 @@ class Float(ComfyTypeIO):
         '''Float input.'''
         def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None, lazy: bool=None,
                     default: float=None, min: float=None, max: float=None, step: float=None, round: float=None,
-                    display_mode: NumberDisplay=None, socketless: bool=None, force_input: bool=None, extra_dict=None, raw_link: bool=None, advanced: bool=None):
+                    display_mode: NumberDisplay=None, gradient_stops: list[dict]=None,
+                    socketless: bool=None, force_input: bool=None, extra_dict=None, raw_link: bool=None, advanced: bool=None):
             super().__init__(id, display_name, optional, tooltip, lazy, default, socketless, None, force_input, extra_dict, raw_link, advanced)
             self.min = min
             self.max = max
             self.step = step
             self.round = round
             self.display_mode = display_mode
+            self.gradient_stops = gradient_stops
             self.default: float
 
         def as_dict(self):
@@ -306,6 +316,7 @@ class Float(ComfyTypeIO):
                 "step": self.step,
                 "round": self.round,
                 "display": self.display_mode,
+                "gradient_stops": self.gradient_stops,
             })
 
 @comfytype(io_type="STRING")
@@ -345,7 +356,7 @@ class Combo(ComfyTypeIO):
             tooltip: str=None,
             lazy: bool=None,
             default: str | int | Enum = None,
-            control_after_generate: bool=None,
+            control_after_generate: bool | ControlAfterGenerate=None,
             upload: UploadType=None,
             image_folder: FolderType=None,
             remote: RemoteOptions=None,
@@ -385,11 +396,10 @@ class Combo(ComfyTypeIO):
 @comfytype(io_type="COMBO")
 class MultiCombo(ComfyTypeI):
     '''Multiselect Combo input (dropdown for selecting potentially more than one value).'''
-    # TODO: something is wrong with the serialization, frontend does not recognize it as multiselect
     Type = list[str]
     class Input(Combo.Input):
         def __init__(self, id: str, options: list[str], display_name: str=None, optional=False, tooltip: str=None, lazy: bool=None,
-                    default: list[str]=None, placeholder: str=None, chip: bool=None, control_after_generate: bool=None,
+                    default: list[str]=None, placeholder: str=None, chip: bool=None, control_after_generate: bool | ControlAfterGenerate=None,
                     socketless: bool=None, extra_dict=None, raw_link: bool=None, advanced: bool=None):
             super().__init__(id, options, display_name, optional, tooltip, lazy, default, control_after_generate, socketless=socketless, extra_dict=extra_dict, raw_link=raw_link, advanced=advanced)
             self.multiselect = True
@@ -398,12 +408,14 @@ class MultiCombo(ComfyTypeI):
             self.default: list[str]
 
         def as_dict(self):
-            to_return = super().as_dict() | prune_dict({
-                "multi_select": self.multiselect,
-                "placeholder": self.placeholder,
-                "chip": self.chip,
+            # Frontend expects `multi_select` to be an object config (not a boolean).
+            # Keep top-level `multiselect` from Combo.Input for backwards compatibility.
+            return super().as_dict() | prune_dict({
+                "multi_select": prune_dict({
+                    "placeholder": self.placeholder,
+                    "chip": self.chip,
+                }),
             })
-            return to_return
 
 @comfytype(io_type="IMAGE")
 class Image(ComfyTypeIO):
@@ -603,6 +615,11 @@ class Model(ComfyTypeIO):
     if TYPE_CHECKING:
         Type = ModelPatcher
 
+@comfytype(io_type="BACKGROUND_REMOVAL")
+class BackgroundRemoval(ComfyTypeIO):
+    if TYPE_CHECKING:
+        Type = BackgroundRemovalModel
+
 @comfytype(io_type="CLIP_VISION")
 class ClipVision(ComfyTypeIO):
     if TYPE_CHECKING:
@@ -667,6 +684,89 @@ class Voxel(ComfyTypeIO):
 class Mesh(ComfyTypeIO):
     Type = MESH
 
+@comfytype(io_type="SPLAT")
+class Splat(ComfyTypeIO):
+    Type = SPLAT
+
+
+@comfytype(io_type="FILE_3D")
+class File3DAny(ComfyTypeIO):
+    """General 3D file type - accepts any supported 3D format."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_GLB")
+class File3DGLB(ComfyTypeIO):
+    """GLB format 3D file - binary glTF, best for web and cross-platform."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_GLTF")
+class File3DGLTF(ComfyTypeIO):
+    """GLTF format 3D file - JSON-based glTF with external resources."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_FBX")
+class File3DFBX(ComfyTypeIO):
+    """FBX format 3D file - best for game engines and animation."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_OBJ")
+class File3DOBJ(ComfyTypeIO):
+    """OBJ format 3D file - simple geometry format."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_STL")
+class File3DSTL(ComfyTypeIO):
+    """STL format 3D file - best for 3D printing."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_USDZ")
+class File3DUSDZ(ComfyTypeIO):
+    """USDZ format 3D file - Apple AR format."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_PLY")
+class File3DPLY(ComfyTypeIO):
+    """PLY format 3D file - point cloud or Gaussian splat."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_SPLAT")
+class File3DSPLAT(ComfyTypeIO):
+    """SPLAT format 3D file - 3D Gaussian splat."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_SPZ")
+class File3DSPZ(ComfyTypeIO):
+    """SPZ format 3D file - compressed 3D Gaussian splat."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_KSPLAT")
+class File3DKSPLAT(ComfyTypeIO):
+    """KSPLAT format 3D file - 3D Gaussian splat."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_SPLAT_ANY")
+class File3DSplatAny(ComfyTypeIO):
+    """General 3D Gaussian splat file type - accepts any supported splat container (.ply / .spz / .splat / .ksplat)."""
+    Type = File3D
+
+
+@comfytype(io_type="FILE_3D_POINT_CLOUD_ANY")
+class File3DPointCloudAny(ComfyTypeIO):
+    """General point cloud file type - accepts any supported point cloud container (currently .ply)."""
+    Type = File3D
+
+
 @comfytype(io_type="HOOKS")
 class Hooks(ComfyTypeIO):
     if TYPE_CHECKING:
@@ -702,12 +802,30 @@ class Accumulation(ComfyTypeIO):
 @comfytype(io_type="LOAD3D_CAMERA")
 class Load3DCamera(ComfyTypeIO):
     class CameraInfo(TypedDict):
-        position: dict[str, float | int]
-        target: dict[str, float | int]
-        zoom: int
-        cameraType: str
+        # Coordinate system: right-handed, Y-up, camera looks down -Z
+        position: dict[str, float | int]  # scene units
+        target: dict[str, float | int]  # scene units; OrbitControls focus point
+        zoom: float | int  # dimensionless, 1 = 100%
+        cameraType: str  # 'perspective' | 'orthographic'
+        quaternion: NotRequired[dict[str, float | int]]  # normalized, dimensionless; camera world rotation
+        fov: NotRequired[float | int]  # degrees, vertical FOV (perspective only)
+        aspect: NotRequired[float | int]  # width / height (perspective only)
+        near: NotRequired[float | int]  # scene units
+        far: NotRequired[float | int]  # scene units
+        frustum: NotRequired[dict[str, float | int]]  # orthographic only: {left, right, top, bottom} in scene units
 
     Type = CameraInfo
+
+
+@comfytype(io_type="LOAD3D_MODEL_INFO")
+class Load3DModelInfo(ComfyTypeIO):
+    class Model3DTransform(TypedDict):
+        # Coordinate system: right-handed, Y-up, world space
+        position: dict[str, float | int]  # scene units
+        quaternion: dict[str, float | int]  # normalized, dimensionless; world rotation
+        scale: dict[str, float | int]  # dimensionless multiplier
+
+    Type = list[Model3DTransform]
 
 
 @comfytype(io_type="LOAD_3D")
@@ -719,6 +837,7 @@ class Load3D(ComfyTypeIO):
         normal: str
         camera_info: Load3DCamera.CameraInfo
         recording: NotRequired[str]
+        model_3d_info: NotRequired[list[Load3DModelInfo.Model3DTransform]]
 
     Type = Model3DDict
 
@@ -726,6 +845,61 @@ class Load3D(ComfyTypeIO):
 @comfytype(io_type="LOAD_3D_ANIMATION")
 class Load3DAnimation(Load3D):
     ...
+
+
+@comfytype(io_type="LAYERS")
+class Layers(ComfyTypeIO):
+    BlendMode = Literal[
+        "normal", "multiply", "screen", "overlay", "darken", "lighten",
+        "color-dodge", "color-burn", "hard-light", "soft-light", "difference",
+        "exclusion", "linear-dodge", "linear-burn", "vivid-light", "pin-light",
+        "linear-light", "hard-mix", "subtract", "divide", "grain-extract",
+        "grain-merge", "hue", "saturation", "color", "luminosity",
+    ]
+
+    class LayerItem(TypedDict):
+        image: torch.Tensor
+        type: Literal["raster"]
+        x: NotRequired[int]
+        y: NotRequired[int]
+        mask: NotRequired[torch.Tensor]
+        z_index: int
+        name: NotRequired[str]
+        opacity: NotRequired[float]
+        blend_mode: NotRequired["Layers.BlendMode"]
+        visible: NotRequired[bool]
+        flip_h: NotRequired[bool]
+        flip_v: NotRequired[bool]
+        rotation: NotRequired[float]
+        w: NotRequired[int]
+        h: NotRequired[int]
+
+    class Document(TypedDict):
+        version: int
+        canvas: NotRequired[tuple[int, int]]
+        layers: list["Layers.LayerItem"]
+
+    Type = Document
+
+
+@comfytype(io_type="COMPOSITOR")
+class Compositor(ComfyTypeIO):
+    class LayerState(TypedDict):
+        version: NotRequired[int]
+        canvas: dict
+        background: NotRequired[dict]
+        inputs: NotRequired[list[str]]
+        order: NotRequired[list[int]]
+        layers: list[dict]
+
+    Type = LayerState
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                     socketless: bool=True, default: dict=None, advanced: bool=None):
+            super().__init__(id, display_name, optional, tooltip, None, default, socketless, None, None, None, None, advanced)
+            if default is None:
+                self.default = {}
 
 
 @comfytype(io_type="PHOTOMAKER")
@@ -771,6 +945,14 @@ class Tracks(ComfyTypeIO):
         track_path: torch.Tensor
         track_visibility: torch.Tensor
     Type = TrackDict
+
+@comfytype(io_type="DICT")
+class Dict(ComfyTypeIO):
+    Type = dict
+
+@comfytype(io_type="ARRAY")
+class Array(ComfyTypeIO):
+    Type = list
 
 @comfytype(io_type="COMFY_MULTITYPED_V3")
 class MultiType:
@@ -1146,6 +1328,193 @@ class ImageCompare(ComfyTypeI):
       def as_dict(self):
           return super().as_dict()
 
+
+@comfytype(io_type="COLOR")
+class Color(ComfyTypeIO):
+  Type = str
+
+  class Input(WidgetInput):
+      def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                   socketless: bool=True, advanced: bool=None, default: str="#ffffff"):
+          super().__init__(id, display_name, optional, tooltip, None, default, socketless, None, None, None, None, advanced)
+          self.default: str
+
+      def as_dict(self):
+          return super().as_dict()
+
+
+@comfytype(io_type="COLORS")
+class Colors(ComfyTypeIO):
+    Type = list[Color.Type]
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                     socketless: bool=True, default: list[str]=None, advanced: bool=None):
+            super().__init__(id, display_name, optional, tooltip, None, default, socketless, None, None, None, None, advanced)
+            if default is None:
+                self.default = []
+
+
+@comfytype(io_type="BOUNDING_BOX")
+class BoundingBox(ComfyTypeIO):
+    class BoundingBoxDict(TypedDict):
+        x: int
+        y: int
+        width: int
+        height: int
+    Type = BoundingBoxDict
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                     socketless: bool=True, default: dict=None, component: str=None, force_input: bool=None):
+            super().__init__(id, display_name, optional, tooltip, None, default, socketless)
+            self.component = component
+            self.force_input = force_input
+            if default is None:
+                self.default = {"x": 0, "y": 0, "width": 512, "height": 512}
+
+        def as_dict(self):
+            d = super().as_dict()
+            if self.component:
+                d["component"] = self.component
+            if self.force_input is not None:
+                d["forceInput"] = self.force_input
+            return d
+
+
+@comfytype(io_type="CURVE")
+class Curve(ComfyTypeIO):
+    from comfy_api.input import CurvePoint
+    if TYPE_CHECKING:
+        Type = CurveInput_
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                     socketless: bool=True, default: list[tuple[float, float]]=None, advanced: bool=None):
+            super().__init__(id, display_name, optional, tooltip, None, default, socketless, None, None, None, None, advanced)
+            if default is None:
+                self.default = [(0.0, 0.0), (1.0, 1.0)]
+
+        def as_dict(self):
+            d = super().as_dict()
+            if self.default is not None:
+                d["default"] = {"points": [list(p) for p in self.default], "interpolation": "monotone_cubic"}
+            return d
+
+
+@comfytype(io_type="BOUNDING_BOXES")
+class BoundingBoxes(ComfyTypeIO):
+    class BoundingBoxWithMetadata(BoundingBox.BoundingBoxDict):
+        metadata: dict
+    Type = list[BoundingBoxWithMetadata]
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                     socketless: bool=True, default: list[dict]=None, advanced: bool=None):
+            super().__init__(id, display_name, optional, tooltip, None, default, socketless, None, None, None, None, advanced)
+            if default is None:
+                self.default = []
+
+
+@comfytype(io_type="VIDEO_EDIT")
+class VideoEdit(ComfyTypeIO):
+    class VideoTrimSection(TypedDict):
+        start_time: float
+        duration: float
+
+    class VideoCropSection(TypedDict):
+        x: int
+        y: int
+        width: int
+        height: int
+
+    class VideoEditDict(TypedDict, total=False):
+        trim: 'VideoEdit.VideoTrimSection'
+        crop: 'VideoEdit.VideoCropSection'
+    Type = VideoEditDict
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                     socketless: bool=True, default: dict=None, features: list[str]=None, advanced: bool=None):
+            super().__init__(id, display_name, optional, tooltip, None, default, socketless, None, None, None, None, advanced)
+            self.features = features if features is not None else ["trim", "crop"]
+            if default is None:
+                self.default = {}
+                if "trim" in self.features:
+                    self.default["trim"] = {"start_time": 0.0, "duration": 0.0}
+                if "crop" in self.features:
+                    self.default["crop"] = {"x": 0, "y": 0, "width": 0, "height": 0}
+
+        def as_dict(self):
+            return super().as_dict() | prune_dict({
+                "features": self.features,
+            })
+
+
+@comfytype(io_type="RESOLUTION_PREVIEW")
+class ResolutionPreview(ComfyTypeIO):
+    Type = dict
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=True, tooltip: str=None,
+                     socketless: bool=True, advanced: bool=None,
+                     ratio_widget: str="aspect_ratio", megapixels_widget: str="megapixels", multiple_widget: str="multiple"):
+            super().__init__(id, display_name, optional, tooltip, None, None, socketless, None, None, None, None, advanced)
+            self.ratio_widget = ratio_widget
+            self.megapixels_widget = megapixels_widget
+            self.multiple_widget = multiple_widget
+
+        def as_dict(self):
+            return super().as_dict() | prune_dict({
+                "ratio_widget": self.ratio_widget,
+                "megapixels_widget": self.megapixels_widget,
+                "multiple_widget": self.multiple_widget,
+            })
+
+
+@comfytype(io_type="HISTOGRAM")
+class Histogram(ComfyTypeIO):
+    """A histogram represented as a list of bin counts."""
+    Type = list[int]
+
+
+@comfytype(io_type="RANGE")
+class Range(ComfyTypeIO):
+    from comfy_api.input import RangeInput
+    if TYPE_CHECKING:
+        Type = RangeInput
+
+    class Input(WidgetInput):
+        def __init__(self, id: str, display_name: str=None, optional=False, tooltip: str=None,
+                     socketless: bool=True, default: dict=None,
+                     display: str=None,
+                     gradient_stops: list=None,
+                     show_midpoint: bool=None,
+                     midpoint_scale: str=None,
+                     value_min: float=None,
+                     value_max: float=None,
+                     advanced: bool=None):
+            super().__init__(id, display_name, optional, tooltip, None, default, socketless, None, None, None, None, advanced)
+            if default is None:
+                self.default = {"min": 0.0, "max": 1.0}
+            self.display = display
+            self.gradient_stops = gradient_stops
+            self.show_midpoint = show_midpoint
+            self.midpoint_scale = midpoint_scale
+            self.value_min = value_min
+            self.value_max = value_max
+
+        def as_dict(self):
+            return super().as_dict() | prune_dict({
+                "display": self.display,
+                "gradient_stops": self.gradient_stops,
+                "show_midpoint": self.show_midpoint,
+                "midpoint_scale": self.midpoint_scale,
+                "value_min": self.value_min,
+                "value_max": self.value_max,
+            })
+
+
 DYNAMIC_INPUT_LOOKUP: dict[str, Callable[[dict[str, Any], dict[str, Any], tuple[str, dict[str, Any]], str, list[str] | None], None]] = {}
 def register_dynamic_input_func(io_type: str, func: Callable[[dict[str, Any], dict[str, Any], tuple[str, dict[str, Any]], str, list[str] | None], None]):
     DYNAMIC_INPUT_LOOKUP[io_type] = func
@@ -1177,7 +1546,8 @@ class V3Data(TypedDict):
 class HiddenHolder:
     def __init__(self, unique_id: str, prompt: Any,
                  extra_pnginfo: Any, dynprompt: Any,
-                 auth_token_comfy_org: str, api_key_comfy_org: str, **kwargs):
+                 auth_token_comfy_org: str, api_key_comfy_org: str,
+                 comfy_usage_source: str = None, **kwargs):
         self.unique_id = unique_id
         """UNIQUE_ID is the unique identifier of the node, and matches the id property of the node on the client side. It is commonly used in client-server communications (see messages)."""
         self.prompt = prompt
@@ -1190,6 +1560,8 @@ class HiddenHolder:
         """AUTH_TOKEN_COMFY_ORG is a token acquired from signing into a ComfyOrg account on frontend."""
         self.api_key_comfy_org = api_key_comfy_org
         """API_KEY_COMFY_ORG is an API Key generated by ComfyOrg that allows skipping signing into a ComfyOrg account on frontend."""
+        self.comfy_usage_source = comfy_usage_source
+        """COMFY_USAGE_SOURCE identifies the client that submitted the prompt (e.g. comfyui-frontend, comfy-cli, comfyui-mcp); forwarded to API nodes' upstream requests via the Comfy-Usage-Source header."""
 
     def __getattr__(self, key: str):
         '''If hidden variable not found, return None.'''
@@ -1206,6 +1578,7 @@ class HiddenHolder:
             dynprompt=d.get(Hidden.dynprompt, None),
             auth_token_comfy_org=d.get(Hidden.auth_token_comfy_org, None),
             api_key_comfy_org=d.get(Hidden.api_key_comfy_org, None),
+            comfy_usage_source=d.get(Hidden.comfy_usage_source, None),
         )
 
     @classmethod
@@ -1228,12 +1601,15 @@ class Hidden(str, Enum):
     """AUTH_TOKEN_COMFY_ORG is a token acquired from signing into a ComfyOrg account on frontend."""
     api_key_comfy_org = "API_KEY_COMFY_ORG"
     """API_KEY_COMFY_ORG is an API Key generated by ComfyOrg that allows skipping signing into a ComfyOrg account on frontend."""
+    comfy_usage_source = "COMFY_USAGE_SOURCE"
+    """COMFY_USAGE_SOURCE identifies the client that submitted the prompt (e.g. comfyui-frontend, comfy-cli, comfyui-mcp); forwarded to API nodes' upstream requests via the Comfy-Usage-Source header."""
 
 
 @dataclass
 class NodeInfoV1:
     input: dict=None
     input_order: dict[str, list[str]]=None
+    is_input_list: bool=None
     output: list[str]=None
     output_is_list: list[bool]=None
     output_name: list[str]=None
@@ -1247,25 +1623,12 @@ class NodeInfoV1:
     output_node: bool=None
     deprecated: bool=None
     experimental: bool=None
+    dev_only: bool=None
     api_node: bool=None
     price_badge: dict | None = None
     search_aliases: list[str]=None
-
-@dataclass
-class NodeInfoV3:
-    input: dict=None
-    output: dict=None
-    hidden: list[str]=None
-    name: str=None
-    display_name: str=None
-    description: str=None
-    python_module: Any = None
-    category: str=None
-    output_node: bool=None
-    deprecated: bool=None
-    experimental: bool=None
-    api_node: bool=None
-    price_badge: dict | None = None
+    essentials_category: str=None
+    has_intermediate_output: bool=None
 
 
 @dataclass
@@ -1375,6 +1738,8 @@ class Schema:
     """Flags a node as deprecated, indicating to users that they should find alternatives to this node."""
     is_experimental: bool=False
     """Flags a node as experimental, informing users that it may change or not work as expected."""
+    is_dev_only: bool=False
+    """Flags a node as dev-only, hiding it from search/menus unless dev mode is enabled."""
     is_api_node: bool=False
     """Flags a node as an API node. See: https://docs.comfy.org/tutorials/api-nodes/overview."""
     price_badge: PriceBadge | None = None
@@ -1383,6 +1748,20 @@ class Schema:
     """Flags a node as not idempotent; when True, the node will run and not reuse the cached outputs when identical inputs are provided on a different node in the graph."""
     enable_expand: bool=False
     """Flags a node as expandable, allowing NodeOutput to include 'expand' property."""
+    accept_all_inputs: bool=False
+    """When True, all inputs from the prompt will be passed to the node as kwargs, even if not defined in the schema."""
+    essentials_category: str | None = None
+    """Optional category for the Essentials tab. Path-based like category field (e.g., 'Basic', 'Image Tools/Editing')."""
+    has_intermediate_output: bool=False
+    """Flags this node as having intermediate output that should persist across page refreshes.
+
+    Nodes with this flag behave like output nodes (their UI results are cached and resent
+    to the frontend) but do NOT automatically get added to the execution list. This means
+    they will only execute if they are on the dependency path of a real output node.
+
+    Use this for nodes with interactive/operable UI regions that produce intermediate outputs
+    (e.g., Image Crop, Painter) rather than final outputs (e.g., Save Image).
+    """
 
     def validate(self):
         '''Validate the schema:
@@ -1427,6 +1806,8 @@ class Schema:
                 self.hidden.append(Hidden.auth_token_comfy_org)
             if Hidden.api_key_comfy_org not in self.hidden:
                 self.hidden.append(Hidden.api_key_comfy_org)
+            if Hidden.comfy_usage_source not in self.hidden:
+                self.hidden.append(Hidden.comfy_usage_source)
         # if is an output_node, will need prompt and extra_pnginfo
         if self.is_output_node:
             if Hidden.prompt not in self.hidden:
@@ -1471,6 +1852,7 @@ class Schema:
         info = NodeInfoV1(
             input=input,
             input_order={key: list(value.keys()) for (key, value) in input.items()},
+            is_input_list=self.is_input_list,
             output=output,
             output_is_list=output_is_list,
             output_name=output_name,
@@ -1481,45 +1863,15 @@ class Schema:
             category=self.category,
             description=self.description,
             output_node=self.is_output_node,
+            has_intermediate_output=self.has_intermediate_output,
             deprecated=self.is_deprecated,
             experimental=self.is_experimental,
+            dev_only=self.is_dev_only,
             api_node=self.is_api_node,
             python_module=getattr(cls, "RELATIVE_PYTHON_MODULE", "nodes"),
             price_badge=self.price_badge.as_dict(self.inputs) if self.price_badge is not None else None,
             search_aliases=self.search_aliases if self.search_aliases else None,
-        )
-        return info
-
-
-    def get_v3_info(self, cls) -> NodeInfoV3:
-        input_dict = {}
-        output_dict = {}
-        hidden_list = []
-        # TODO: make sure dynamic types will be handled correctly
-        if self.inputs:
-            for input in self.inputs:
-                add_to_dict_v3(input, input_dict)
-        if self.outputs:
-            for output in self.outputs:
-                add_to_dict_v3(output, output_dict)
-        if self.hidden:
-            for hidden in self.hidden:
-                hidden_list.append(hidden.value)
-
-        info = NodeInfoV3(
-            input=input_dict,
-            output=output_dict,
-            hidden=hidden_list,
-            name=self.node_id,
-            display_name=self.display_name,
-            description=self.description,
-            category=self.category,
-            output_node=self.is_output_node,
-            deprecated=self.is_deprecated,
-            experimental=self.is_experimental,
-            api_node=self.is_api_node,
-            python_module=getattr(cls, "RELATIVE_PYTHON_MODULE", "nodes"),
-            price_badge=self.price_badge.as_dict(self.inputs) if self.price_badge is not None else None,
+            essentials_category=self.essentials_category,
         )
         return info
 
@@ -1576,9 +1928,6 @@ def add_to_dict_v1(i: Input, d: dict):
     # for v1, we don't want to include the optional key
     as_dict.pop("optional", None)
     d.setdefault(key, {})[i.id] = (i.get_io_type(), as_dict)
-
-def add_to_dict_v3(io: Input | Output, d: dict):
-    d[io.id] = (io.get_io_type(), io.as_dict())
 
 class DynamicPathsDefaultValue:
     EMPTY_DICT = "empty_dict"
@@ -1740,13 +2089,6 @@ class _ComfyNodeBaseInternal(_ComfyNodeInternal):
         # set hidden
         type_clone.hidden = HiddenHolder.from_v3_data(v3_data)
         return type_clone
-
-    @final
-    @classmethod
-    def GET_NODE_INFO_V3(cls) -> dict[str, Any]:
-        schema = cls.GET_SCHEMA()
-        info = schema.get_v3_info(cls)
-        return asdict(info)
     #############################################
     # V1 Backwards Compatibility code
     #--------------------------------------------
@@ -1789,6 +2131,14 @@ class _ComfyNodeBaseInternal(_ComfyNodeInternal):
             cls.GET_SCHEMA()
         return cls._DEPRECATED
 
+    _DEV_ONLY = None
+    @final
+    @classproperty
+    def DEV_ONLY(cls):  # noqa
+        if cls._DEV_ONLY is None:
+            cls.GET_SCHEMA()
+        return cls._DEV_ONLY
+
     _API_NODE = None
     @final
     @classproperty
@@ -1804,6 +2154,14 @@ class _ComfyNodeBaseInternal(_ComfyNodeInternal):
         if cls._OUTPUT_NODE is None:
             cls.GET_SCHEMA()
         return cls._OUTPUT_NODE
+
+    _HAS_INTERMEDIATE_OUTPUT = None
+    @final
+    @classproperty
+    def HAS_INTERMEDIATE_OUTPUT(cls):  # noqa
+        if cls._HAS_INTERMEDIATE_OUTPUT is None:
+            cls.GET_SCHEMA()
+        return cls._HAS_INTERMEDIATE_OUTPUT
 
     _INPUT_IS_LIST = None
     @final
@@ -1853,6 +2211,14 @@ class _ComfyNodeBaseInternal(_ComfyNodeInternal):
             cls.GET_SCHEMA()
         return cls._NOT_IDEMPOTENT
 
+    _ACCEPT_ALL_INPUTS = None
+    @final
+    @classproperty
+    def ACCEPT_ALL_INPUTS(cls):  # noqa
+        if cls._ACCEPT_ALL_INPUTS is None:
+            cls.GET_SCHEMA()
+        return cls._ACCEPT_ALL_INPUTS
+
     @final
     @classmethod
     def INPUT_TYPES(cls) -> dict[str, dict]:
@@ -1883,14 +2249,20 @@ class _ComfyNodeBaseInternal(_ComfyNodeInternal):
             cls._EXPERIMENTAL = schema.is_experimental
         if cls._DEPRECATED is None:
             cls._DEPRECATED = schema.is_deprecated
+        if cls._DEV_ONLY is None:
+            cls._DEV_ONLY = schema.is_dev_only
         if cls._API_NODE is None:
             cls._API_NODE = schema.is_api_node
         if cls._OUTPUT_NODE is None:
             cls._OUTPUT_NODE = schema.is_output_node
+        if cls._HAS_INTERMEDIATE_OUTPUT is None:
+            cls._HAS_INTERMEDIATE_OUTPUT = schema.has_intermediate_output
         if cls._INPUT_IS_LIST is None:
             cls._INPUT_IS_LIST = schema.is_input_list
         if cls._NOT_IDEMPOTENT is None:
             cls._NOT_IDEMPOTENT = schema.not_idempotent
+        if cls._ACCEPT_ALL_INPUTS is None:
+            cls._ACCEPT_ALL_INPUTS = schema.accept_all_inputs
 
         if cls._RETURN_TYPES is None:
             output = []
@@ -2004,11 +2376,74 @@ class _UIOutput(ABC):
         ...
 
 
+class InputMapOldId(TypedDict):
+    """Map an old node input to a new node input by ID."""
+    new_id: str
+    old_id: str
+
+class InputMapSetValue(TypedDict):
+    """Set a specific value for a new node input."""
+    new_id: str
+    set_value: Any
+
+InputMap = InputMapOldId | InputMapSetValue
+"""
+Input mapping for node replacement. Type is inferred by dictionary keys:
+- {"new_id": str, "old_id": str} - maps old input to new input
+- {"new_id": str, "set_value": Any} - sets a specific value for new input
+"""
+
+class OutputMap(TypedDict):
+    """Map outputs of node replacement via indexes."""
+    new_idx: int
+    old_idx: int
+
+class NodeReplace:
+    """
+    Defines a possible node replacement, mapping inputs and outputs of the old node to the new node.
+
+    Also supports assigning specific values to the input widgets of the new node.
+
+    Args:
+        new_node_id: The class name of the new replacement node.
+        old_node_id: The class name of the deprecated node.
+        old_widget_ids: Ordered list of input IDs for widgets that may not have an input slot
+            connected. The workflow JSON stores widget values by their relative position index,
+            not by ID. This list maps those positional indexes to input IDs, enabling the
+            replacement system to correctly identify widget values during node migration.
+        input_mapping: List of input mappings from old node to new node.
+        output_mapping: List of output mappings from old node to new node.
+    """
+    def __init__(self,
+        new_node_id: str,
+        old_node_id: str,
+        old_widget_ids: list[str] | None=None,
+        input_mapping: list[InputMap] | None=None,
+        output_mapping: list[OutputMap] | None=None,
+    ):
+        self.new_node_id = new_node_id
+        self.old_node_id = old_node_id
+        self.old_widget_ids = old_widget_ids
+        self.input_mapping = input_mapping
+        self.output_mapping = output_mapping
+
+    def as_dict(self):
+        """Create serializable representation of the node replacement."""
+        return {
+            "new_node_id": self.new_node_id,
+            "old_node_id": self.old_node_id,
+            "old_widget_ids": self.old_widget_ids,
+            "input_mapping": list(self.input_mapping) if self.input_mapping else None,
+            "output_mapping": list(self.output_mapping) if self.output_mapping else None,
+        }
+
+
 __all__ = [
     "FolderType",
     "UploadType",
     "RemoteOptions",
     "NumberDisplay",
+    "ControlAfterGenerate",
 
     "comfytype",
     "Custom",
@@ -2041,6 +2476,7 @@ __all__ = [
     "ModelPatch",
     "ClipVision",
     "ClipVisionOutput",
+    "BackgroundRemoval",
     "AudioEncoder",
     "AudioEncoderOutput",
     "StyleModel",
@@ -2054,6 +2490,20 @@ __all__ = [
     "LossMap",
     "Voxel",
     "Mesh",
+    "Splat",
+    "File3DAny",
+    "File3DGLB",
+    "File3DGLTF",
+    "File3DFBX",
+    "File3DOBJ",
+    "File3DSTL",
+    "File3DUSDZ",
+    "File3DPLY",
+    "File3DSPLAT",
+    "File3DSPZ",
+    "File3DKSPLAT",
+    "File3DSplatAny",
+    "File3DPointCloudAny",
     "Hooks",
     "HookKeyframes",
     "TimestepsRange",
@@ -2061,8 +2511,11 @@ __all__ = [
     "FlowControl",
     "Accumulation",
     "Load3DCamera",
+    "Load3DModelInfo",
     "Load3D",
     "Load3DAnimation",
+    "Compositor",
+    "Layers",
     "Photomaker",
     "Point",
     "FaceAnalysis",
@@ -2071,6 +2524,9 @@ __all__ = [
     "AnyType",
     "MultiType",
     "Tracks",
+    "Dict",
+    "Array",
+    "Color",
     # Dynamic Types
     "MatchType",
     "DynamicCombo",
@@ -2079,14 +2535,21 @@ __all__ = [
     "HiddenHolder",
     "Hidden",
     "NodeInfoV1",
-    "NodeInfoV3",
     "Schema",
     "ComfyNode",
     "NodeOutput",
     "add_to_dict_v1",
-    "add_to_dict_v3",
     "V3Data",
     "ImageCompare",
     "PriceBadgeDepends",
     "PriceBadge",
+    "BoundingBox",
+    "BoundingBoxes",
+    "Colors",
+    "Curve",
+    "Histogram",
+    "Range",
+    "VideoEdit",
+    "ResolutionPreview",
+    "NodeReplace",
 ]

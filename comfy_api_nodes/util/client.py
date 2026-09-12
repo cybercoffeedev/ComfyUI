@@ -2,9 +2,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import time
 import uuid
-from collections.abc import Callable, Iterable
+import weakref
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
@@ -16,13 +18,19 @@ from aiohttp.client_exceptions import ClientError, ContentTypeError
 from pydantic import BaseModel
 
 from comfy import utils
+from comfy.model_management import (
+    InterruptProcessingException,
+    interrupt_current_processing,
+    throw_exception_if_processing_interrupted,
+)
 from comfy_api.latest import IO
 from server import PromptServer
 
 from . import request_logger
 from ._helpers import (
+    _retry_after_wait,
     default_base_url,
-    get_auth_header,
+    get_comfy_api_headers,
     get_node_id,
     is_processing_interrupted,
     sleep_with_interrupt,
@@ -57,14 +65,16 @@ class _RequestConfig:
     files: dict[str, Any] | list[tuple[str, Any]] | None
     multipart_parser: Callable | None
     max_retries: int
+    max_retries_on_rate_limit: int
     retry_delay: float
     retry_backoff: float
     wait_label: str = "Waiting"
     monitor_progress: bool = True
-    estimated_total: int | None = None
     final_label_on_success: str | None = "Completed"
     progress_origin_ts: float | None = None
     price_extractor: Callable[[dict[str, Any]], float | None] | None = None
+    is_rate_limited: Callable[[int, Any], bool] | None = None
+    response_header_validator: Callable[[dict[str, str]], None] | None = None
 
 
 @dataclass
@@ -74,14 +84,83 @@ class _PollUIState:
     is_queued: bool = True
     price: float | None = None
     estimated_duration: int | None = None
+    estimated_p90: int | None = None
+    estimate_includes_queue: bool = False
     base_processing_elapsed: float = 0.0  # sum of completed active intervals
     active_since: float | None = None  # start time of current active interval (None if queued)
 
 
-_RETRY_STATUS = {408, 429, 500, 502, 503, 504}
+_RETRY_STATUS = {408, 500, 502, 503, 504}  # status 429 is handled separately
+_MAX_RETRY_AFTER_WAIT = 150.0  # Cap a server Retry-After at this many seconds so a large hint can't block execution
+
+PRICE_CREDITS_HEADER = "X-Comfy-Credits-Used"
+"""Proxy response header with the actual cost in Comfy credits. When present on any successful proxied response,
+it takes precedence over ``price_extractor``."""
+
+ESTIMATED_DURATION_HEADER = "X-Comfy-Estimated-Duration-Seconds"
+ESTIMATED_DURATION_P90_HEADER = "X-Comfy-Estimated-Duration-P90-Seconds"
+ESTIMATE_SOURCE_HEADER = "X-Comfy-Estimate-Source"
+
+_credits_used_by_execution: "weakref.WeakKeyDictionary[type, float]" = weakref.WeakKeyDictionary()
+"""Last PRICE_CREDITS_HEADER value per node execution, keyed by the node's per-execution class clone."""
+
+
+@dataclass
+class _ServerEstimate:
+    p50_seconds: int
+    p90_seconds: int | None
+    source: str | None
+
+
+_server_estimates_by_execution: "weakref.WeakKeyDictionary[type, _ServerEstimate]" = weakref.WeakKeyDictionary()
 COMPLETED_STATUSES = ["succeeded", "succeed", "success", "completed", "finished", "done", "complete"]
 FAILED_STATUSES = ["cancelled", "canceled", "canceling", "fail", "failed", "error"]
-QUEUED_STATUSES = ["created", "queued", "queueing", "submitted", "initializing"]
+QUEUED_STATUSES = ["created", "queued", "queueing", "submitted", "initializing", "wait", "in_queue"]
+
+
+def _maybe_remember_credits_used(node_cls: type[IO.ComfyNode], header_value: str | None) -> None:
+    """Remember a PRICE_CREDITS_HEADER value from a successful proxied response."""
+    if not header_value:
+        return
+    try:
+        credits_used = float(header_value)
+    except (TypeError, ValueError):
+        logging.debug("Ignoring malformed %s header: %r", PRICE_CREDITS_HEADER, header_value)
+        return
+    if not math.isfinite(credits_used) or credits_used < 0:
+        logging.debug("Ignoring out-of-range %s header: %r", PRICE_CREDITS_HEADER, header_value)
+        return
+    _credits_used_by_execution[node_cls] = credits_used + 0.0  # normalize -0.0
+
+
+def _get_remembered_credits_used(node_cls: type[IO.ComfyNode]) -> float | None:
+    return _credits_used_by_execution.get(node_cls)
+
+
+def _parse_estimate_seconds(header_value: str | None) -> int | None:
+    if not header_value:
+        return None
+    try:
+        seconds = int(header_value.strip())
+    except ValueError:
+        logging.debug("Ignoring malformed estimate header value: %r", header_value)
+        return None
+    if not 1 <= seconds <= 86400:
+        logging.debug("Ignoring out-of-range estimate header value: %r", header_value)
+        return None
+    return seconds
+
+
+def _maybe_remember_server_estimate(node_cls: type[IO.ComfyNode], headers: Mapping[str, str]) -> None:
+    p50 = _parse_estimate_seconds(headers.get(ESTIMATED_DURATION_HEADER))
+    if p50 is None:
+        return
+    p90 = _parse_estimate_seconds(headers.get(ESTIMATED_DURATION_P90_HEADER))
+    if p90 is not None and p90 < p50:
+        p90 = p50
+    source = headers.get(ESTIMATE_SOURCE_HEADER) or None
+    _server_estimates_by_execution[node_cls] = _ServerEstimate(p50, p90, source)
+    logging.debug("Server duration estimate: p50=%ss, p90=%s, source=%s", p50, p90, source)
 
 
 async def sync_op(
@@ -99,10 +178,11 @@ async def sync_op(
     retry_delay: float = 1.0,
     retry_backoff: float = 2.0,
     wait_label: str = "Waiting for server",
-    estimated_duration: int | None = None,
     final_label_on_success: str | None = "Completed",
     progress_origin_ts: float | None = None,
     monitor_progress: bool = True,
+    max_retries_on_rate_limit: int = 16,
+    is_rate_limited: Callable[[int, Any], bool] | None = None,
 ) -> M:
     raw = await sync_op_raw(
         cls,
@@ -117,11 +197,12 @@ async def sync_op(
         retry_delay=retry_delay,
         retry_backoff=retry_backoff,
         wait_label=wait_label,
-        estimated_duration=estimated_duration,
         as_binary=False,
         final_label_on_success=final_label_on_success,
         progress_origin_ts=progress_origin_ts,
         monitor_progress=monitor_progress,
+        max_retries_on_rate_limit=max_retries_on_rate_limit,
+        is_rate_limited=is_rate_limited,
     )
     if not isinstance(raw, dict):
         raise Exception("Expected JSON response to validate into a Pydantic model, got non-JSON (binary or text).")
@@ -141,14 +222,15 @@ async def poll_op(
     queued_statuses: list[str | int] | None = None,
     data: BaseModel | None = None,
     poll_interval: float = 5.0,
-    max_poll_attempts: int = 120,
+    max_poll_attempts: int = 480,
     timeout_per_poll: float = 120.0,
-    max_retries_per_poll: int = 3,
+    max_retries_per_poll: int = 10,
     retry_delay_per_poll: float = 1.0,
-    retry_backoff_per_poll: float = 2.0,
+    retry_backoff_per_poll: float = 1.4,
     estimated_duration: int | None = None,
     cancel_endpoint: ApiEndpoint | None = None,
     cancel_timeout: float = 10.0,
+    extra_text: str | None = None,
 ) -> M:
     raw = await poll_op_raw(
         cls,
@@ -169,6 +251,7 @@ async def poll_op(
         estimated_duration=estimated_duration,
         cancel_endpoint=cancel_endpoint,
         cancel_timeout=cancel_timeout,
+        extra_text=extra_text,
     )
     if not isinstance(raw, dict):
         raise Exception("Expected JSON response to validate into a Pydantic model, got non-JSON (binary or text).")
@@ -189,16 +272,19 @@ async def sync_op_raw(
     retry_delay: float = 1.0,
     retry_backoff: float = 2.0,
     wait_label: str = "Waiting for server",
-    estimated_duration: int | None = None,
     as_binary: bool = False,
     final_label_on_success: str | None = "Completed",
     progress_origin_ts: float | None = None,
     monitor_progress: bool = True,
+    max_retries_on_rate_limit: int = 16,
+    is_rate_limited: Callable[[int, Any], bool] | None = None,
+    response_header_validator: Callable[[dict[str, str]], None] | None = None,
 ) -> dict[str, Any] | bytes:
     """
     Make a single network request.
       - If as_binary=False (default): returns JSON dict (or {'_raw': '<text>'} if non-JSON).
       - If as_binary=True: returns bytes.
+      - response_header_validator: optional callback receiving response headers dict
     """
     if isinstance(data, BaseModel):
         data = data.model_dump(exclude_none=True)
@@ -218,10 +304,12 @@ async def sync_op_raw(
         retry_backoff=retry_backoff,
         wait_label=wait_label,
         monitor_progress=monitor_progress,
-        estimated_total=estimated_duration,
         final_label_on_success=final_label_on_success,
         progress_origin_ts=progress_origin_ts,
         price_extractor=price_extractor,
+        max_retries_on_rate_limit=max_retries_on_rate_limit,
+        is_rate_limited=is_rate_limited,
+        response_header_validator=response_header_validator,
     )
     return await _request_base(cfg, expect_binary=as_binary)
 
@@ -238,14 +326,15 @@ async def poll_op_raw(
     queued_statuses: list[str | int] | None = None,
     data: dict[str, Any] | BaseModel | None = None,
     poll_interval: float = 5.0,
-    max_poll_attempts: int = 120,
+    max_poll_attempts: int = 480,
     timeout_per_poll: float = 120.0,
-    max_retries_per_poll: int = 3,
+    max_retries_per_poll: int = 10,
     retry_delay_per_poll: float = 1.0,
-    retry_backoff_per_poll: float = 2.0,
+    retry_backoff_per_poll: float = 1.4,
     estimated_duration: int | None = None,
     cancel_endpoint: ApiEndpoint | None = None,
     cancel_timeout: float = 10.0,
+    extra_text: str | None = None,
 ) -> dict[str, Any]:
     """
     Polls an endpoint until the task reaches a terminal state. Displays time while queued/processing,
@@ -264,11 +353,22 @@ async def poll_op_raw(
     progress_bar = utils.ProgressBar(100) if progress_extractor else None
     last_progress: int | None = None
 
-    state = _PollUIState(started=started, estimated_duration=estimated_duration)
+    server_estimate = _server_estimates_by_execution.pop(cls, None)
+    if server_estimate is not None:
+        state = _PollUIState(
+            started=started,
+            estimated_duration=server_estimate.p50_seconds,
+            estimated_p90=server_estimate.p90_seconds,
+            estimate_includes_queue=True,
+        )
+    else:
+        state = _PollUIState(started=started, estimated_duration=estimated_duration)
+    estimate_bar = utils.ProgressBar(100) if progress_bar is None and server_estimate is not None else None
     stop_ticker = asyncio.Event()
 
     async def _ticker():
         """Emit a UI update every second while polling is in progress."""
+        last_estimate_pct = -1
         try:
             while not stop_ticker.is_set():
                 if is_processing_interrupted():
@@ -277,6 +377,15 @@ async def poll_op_raw(
                 proc_elapsed = state.base_processing_elapsed + (
                     (now - state.active_since) if state.active_since is not None else 0.0
                 )
+                if estimate_bar is not None:
+                    pct = _estimate_progress_pct(now - state.started, state.estimated_duration, state.estimated_p90)
+                    if pct != last_estimate_pct:
+                        try:
+                            estimate_bar.update_absolute(pct, total=100)
+                        except InterruptProcessingException:
+                            interrupt_current_processing()
+                            break
+                        last_estimate_pct = pct
                 _display_time_progress(
                     cls,
                     status=state.status_label,
@@ -285,6 +394,9 @@ async def poll_op_raw(
                     price=state.price,
                     is_queued=state.is_queued,
                     processing_elapsed_seconds=int(proc_elapsed),
+                    extra_text=extra_text,
+                    estimated_p90=state.estimated_p90,
+                    estimate_includes_queue=state.estimate_includes_queue,
                 )
                 await asyncio.sleep(1.0)
         except Exception as exc:
@@ -303,7 +415,6 @@ async def poll_op_raw(
                     retry_delay=retry_delay_per_poll,
                     retry_backoff=retry_backoff_per_poll,
                     wait_label="Checking",
-                    estimated_duration=None,
                     as_binary=False,
                     final_label_on_success=None,
                     monitor_progress=False,
@@ -319,7 +430,6 @@ async def poll_op_raw(
                             timeout=cancel_timeout,
                             max_retries=0,
                             wait_label="Cancelling task",
-                            estimated_duration=None,
                             as_binary=False,
                             final_label_on_success=None,
                             monitor_progress=False,
@@ -333,15 +443,26 @@ async def poll_op_raw(
                 status = None
 
             if price_extractor:
-                new_price = price_extractor(resp_json)
+                try:
+                    new_price = price_extractor(resp_json)
+                except Exception as e:
+                    logging.error("Price extraction failed: %s", e)
+                    new_price = None
                 if new_price is not None:
                     state.price = new_price
 
             if progress_extractor:
-                new_progress = progress_extractor(resp_json)
+                try:
+                    new_progress = progress_extractor(resp_json)
+                except Exception as e:
+                    logging.error("Progress extraction failed: %s", e)
+                    new_progress = None
                 if new_progress is not None and last_progress != new_progress:
-                    progress_bar.update_absolute(new_progress, total=100)
-                    last_progress = new_progress
+                    try:
+                        progress_bar.update_absolute(new_progress, total=100)
+                        last_progress = new_progress
+                    except InterruptProcessingException:
+                        interrupt_current_processing()
 
             now_ts = time.monotonic()
             is_queued = status in queued_states
@@ -366,25 +487,29 @@ async def poll_op_raw(
 
                 if progress_bar and last_progress != 100:
                     progress_bar.update_absolute(100, total=100)
+                if estimate_bar is not None:
+                    estimate_bar.update_absolute(100, total=100)
 
                 _display_time_progress(
                     cls,
                     status=status if status else "Completed",
                     elapsed_seconds=int(now_ts - started),
-                    estimated_total=estimated_duration,
+                    estimated_total=None,
                     price=state.price,
                     is_queued=False,
                     processing_elapsed_seconds=int(state.base_processing_elapsed),
+                    extra_text=extra_text,
                 )
                 return resp_json
 
             if status in failed_states:
+                throw_exception_if_processing_interrupted()
                 msg = f"Task failed: {json.dumps(resp_json)}"
                 logging.error(msg)
                 raise Exception(msg)
 
             try:
-                await sleep_with_interrupt(poll_interval, cls, None, None, None)
+                await sleep_with_interrupt(poll_interval, cls, None, None)
             except ProcessingInterrupted:
                 if cancel_endpoint:
                     with contextlib.suppress(Exception):
@@ -394,7 +519,6 @@ async def poll_op_raw(
                             timeout=cancel_timeout,
                             max_retries=0,
                             wait_label="Cancelling task",
-                            estimated_duration=None,
                             as_binary=False,
                             final_label_on_success=None,
                             monitor_progress=False,
@@ -429,10 +553,15 @@ def _display_text(
     display_lines: list[str] = []
     if status:
         display_lines.append(f"Status: {status.capitalize() if isinstance(status, str) else status}")
-    if price is not None:
+    server_credits = _get_remembered_credits_used(node_cls)
+    if server_credits is not None:
+        p = f"{server_credits:,.2f}".rstrip("0").rstrip(".")
+    elif price is not None:
         p = f"{float(price) * 211:,.1f}".rstrip("0").rstrip(".")
-        if p != "0":
-            display_lines.append(f"Price: {p} credits")
+    else:
+        p = None
+    if p is not None and p != "0":
+        display_lines.append(f"Price: {p} credits")
     if text is not None:
         display_lines.append(text)
     if display_lines:
@@ -448,14 +577,36 @@ def _display_time_progress(
     price: float | None = None,
     is_queued: bool | None = None,
     processing_elapsed_seconds: int | None = None,
+    extra_text: str | None = None,
+    estimated_p90: int | None = None,
+    estimate_includes_queue: bool = False,
 ) -> None:
-    if estimated_total is not None and estimated_total > 0 and is_queued is False:
-        pe = processing_elapsed_seconds if processing_elapsed_seconds is not None else elapsed_seconds
-        remaining = max(0, int(estimated_total) - int(pe))
-        time_line = f"Time elapsed: {int(elapsed_seconds)}s (~{remaining}s remaining)"
-    else:
-        time_line = f"Time elapsed: {int(elapsed_seconds)}s"
-    _display_text(node_cls, time_line, status=status, price=price)
+    time_line = f"Time elapsed: {int(elapsed_seconds)}s"
+    if estimated_total is not None and estimated_total > 0:
+        if estimate_includes_queue:
+            if elapsed_seconds < estimated_total:
+                time_line += f" (~{int(estimated_total) - int(elapsed_seconds)}s remaining)"
+            elif estimated_p90 is not None and elapsed_seconds < estimated_p90:
+                time_line += " (should finish soon)"
+            else:
+                time_line += " (taking longer than usual)"
+        elif is_queued is False:
+            pe = processing_elapsed_seconds if processing_elapsed_seconds is not None else elapsed_seconds
+            remaining = max(0, int(estimated_total) - int(pe))
+            time_line += f" (~{remaining}s remaining)"
+    text = f"{time_line}\n\n{extra_text}" if extra_text else time_line
+    _display_text(node_cls, text, status=status, price=price)
+
+
+def _estimate_progress_pct(elapsed_seconds: float, p50_seconds: int | None, p90_seconds: int | None) -> int:
+    if not p50_seconds or p50_seconds <= 0 or elapsed_seconds <= 0:
+        return 0
+    if elapsed_seconds < p50_seconds:
+        return int(90.0 * elapsed_seconds / p50_seconds)
+    horizon = p90_seconds if p90_seconds is not None and p90_seconds > p50_seconds else p50_seconds
+    if elapsed_seconds >= horizon:
+        return 95
+    return 90 + int(5.0 * (elapsed_seconds - p50_seconds) / (horizon - p50_seconds))
 
 
 async def _diagnose_connectivity() -> dict[str, bool]:
@@ -465,10 +616,30 @@ async def _diagnose_connectivity() -> dict[str, bool]:
         "api_accessible": False,
     }
     timeout = aiohttp.ClientTimeout(total=5.0)
+
+    # Probe Google and Baidu in parallel: Google is blocked by the GFW in mainland China, so a Baidu probe is required
+    # to correctly detect that Chinese users with working internet do have working internet.
+    internet_probe_urls = ("https://www.google.com", "https://www.baidu.com")
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        with contextlib.suppress(ClientError, OSError):
-            async with session.get("https://www.google.com") as resp:
-                results["internet_accessible"] = resp.status < 500
+        async def _probe(url: str) -> bool:
+            try:
+                async with session.get(url) as resp:
+                    return resp.status < 500
+            except (ClientError, OSError, asyncio.TimeoutError):
+                return False
+
+        probe_tasks = [asyncio.create_task(_probe(u)) for u in internet_probe_urls]
+        try:
+            for fut in asyncio.as_completed(probe_tasks):
+                if await fut:
+                    results["internet_accessible"] = True
+                    break
+        finally:
+            for t in probe_tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*probe_tasks, return_exceptions=True)
         if not results["internet_accessible"]:
             return results
 
@@ -498,6 +669,35 @@ def _merge_params(endpoint_params: dict[str, Any], method: str, data: dict[str, 
     return params
 
 
+# 5xx codes that mean "switched off", not "try again": retrying only makes the
+# user wait through the backoff for the same answer.
+_TERMINAL_SERVICE_REFUSALS = frozenset({"comfy_cloud_provider_disabled"})
+
+
+def _is_terminal_service_refusal(body: Any) -> bool:
+    return isinstance(body, dict) and body.get("error") in _TERMINAL_SERVICE_REFUSALS
+
+
+def _provider_error_detail(metadata: Any) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("raw")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return raw.strip()[:500]
+        if isinstance(parsed, dict):
+            inner = parsed.get("error")
+            if isinstance(inner, dict) and isinstance(inner.get("message"), str):
+                return inner["message"]
+            if isinstance(parsed.get("message"), str):
+                return parsed["message"]
+        return raw.strip()[:500]
+    code = metadata.get("provider_error_code")
+    return code if isinstance(code, str) and code else None
+
+
 def _friendly_http_message(status: int, body: Any) -> str:
     if status == 401:
         return "Unauthorized: Please login first to use this node."
@@ -506,13 +706,25 @@ def _friendly_http_message(status: int, body: Any) -> str:
     if status == 409:
         return "There is a problem with your account. Please contact support@comfy.org."
     if status == 429:
-        return "Rate Limit Exceeded: Please try again later."
+        return "Rate Limit Exceeded: The server returned 429 after all retry attempts. Please wait and try again."
     try:
         if isinstance(body, dict):
             err = body.get("error")
+            # comfy-api's envelope is flat: {"error": code, "message": text}.
+            if isinstance(err, str):
+                msg = body.get("message")
+                if isinstance(msg, str) and msg:
+                    return msg
             if isinstance(err, dict):
                 msg = err.get("message")
+                if msg is not None and not isinstance(msg, str):
+                    msg = str(msg)
                 typ = err.get("type")
+                detail = _provider_error_detail(err.get("metadata"))
+                if detail and not msg:
+                    msg = detail
+                elif msg and detail and detail not in msg:
+                    msg = f"{msg}: {detail}"
                 if msg and typ:
                     return f"API Error: {msg} (Type: {typ})"
                 if msg:
@@ -563,7 +775,8 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
     """Core request with retries, per-second interruption monitoring, true cancellation, and friendly errors."""
     url = cfg.endpoint.path
     parsed_url = urlparse(url)
-    if not parsed_url.scheme and not parsed_url.netloc:  # is URL relative?
+    is_comfy_api_request = not parsed_url.scheme and not parsed_url.netloc  # is URL relative?
+    if is_comfy_api_request:
         url = urljoin(default_base_url().rstrip("/") + "/", url.lstrip("/"))
 
     method = cfg.endpoint.method
@@ -576,9 +789,7 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                 if is_processing_interrupted():
                     return
                 if cfg.monitor_progress:
-                    _display_time_progress(
-                        cfg.node_cls, cfg.wait_label, int(time.monotonic() - start_ts), cfg.estimated_total
-                    )
+                    _display_time_progress(cfg.node_cls, cfg.wait_label, int(time.monotonic() - start_ts))
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             return  # normal shutdown
@@ -586,6 +797,8 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
     start_time = cfg.progress_origin_ts if cfg.progress_origin_ts is not None else time.monotonic()
     attempt = 0
     delay = cfg.retry_delay
+    rate_limit_attempts = 0
+    rate_limit_delay = cfg.retry_delay
     operation_succeeded: bool = False
     final_elapsed_seconds: int | None = None
     extracted_price: float | None = None
@@ -599,8 +812,8 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
         logging.debug("[DEBUG] HTTP %s %s (attempt %d)", method, url, attempt)
 
         payload_headers = {"Accept": "*/*"} if expect_binary else {"Accept": "application/json"}
-        if not parsed_url.scheme and not parsed_url.netloc:  # is URL relative?
-            payload_headers.update(get_auth_header(cfg.node_cls))
+        if is_comfy_api_request:
+            payload_headers.update(get_comfy_api_headers(cfg.node_cls))
         if cfg.endpoint.headers:
             payload_headers.update(cfg.endpoint.headers)
 
@@ -653,17 +866,14 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                 payload_headers["Content-Type"] = "application/json"
                 payload_kw["json"] = cfg.data or {}
 
-            try:
-                request_logger.log_request_response(
-                    operation_id=operation_id,
-                    request_method=method,
-                    request_url=url,
-                    request_headers=dict(payload_headers) if payload_headers else None,
-                    request_params=dict(params) if params else None,
-                    request_data=request_body_log,
-                )
-            except Exception as _log_e:
-                logging.debug("[DEBUG] request logging failed: %s", _log_e)
+            request_logger.log_request_response(
+                operation_id=operation_id,
+                request_method=method,
+                request_url=url,
+                request_headers=dict(payload_headers) if payload_headers else None,
+                request_params=dict(params) if params else None,
+                request_data=request_body_log,
+            )
 
             req_coro = sess.request(method, url, params=params, **payload_kw)
             req_task = asyncio.create_task(req_coro)
@@ -688,41 +898,38 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                         body = await resp.json()
                     except (ContentTypeError, json.JSONDecodeError):
                         body = await resp.text()
-                    if resp.status in _RETRY_STATUS and attempt <= cfg.max_retries:
+                    should_retry = False
+                    wait_time = 0.0
+                    retry_label = ""
+                    is_rl = resp.status == 429 or (
+                        cfg.is_rate_limited is not None and cfg.is_rate_limited(resp.status, body)
+                    )
+                    if is_rl and rate_limit_attempts < cfg.max_retries_on_rate_limit:
+                        rate_limit_attempts += 1
+                        wait_time = min(rate_limit_delay, 30.0)
+                        rate_limit_delay *= cfg.retry_backoff
+                        retry_label = f"rate-limit retry {rate_limit_attempts} of {cfg.max_retries_on_rate_limit}"
+                        should_retry = True
+                    elif (
+                        resp.status in _RETRY_STATUS
+                        and not _is_terminal_service_refusal(body)
+                        and (attempt - rate_limit_attempts) <= cfg.max_retries
+                    ):
+                        wait_time = delay
+                        delay *= cfg.retry_backoff
+                        retry_label = f"retry {attempt - rate_limit_attempts} of {cfg.max_retries}"
+                        should_retry = True
+
+                    if should_retry:
+                        wait_time = _retry_after_wait(resp.headers.get("Retry-After"), wait_time, _MAX_RETRY_AFTER_WAIT)
                         logging.warning(
-                            "HTTP %s %s -> %s. Retrying in %.2fs (retry %d of %d).",
+                            "HTTP %s %s -> %s. Waiting %.2fs (%s).",
                             method,
                             url,
                             resp.status,
-                            delay,
-                            attempt,
-                            cfg.max_retries,
+                            wait_time,
+                            retry_label,
                         )
-                        try:
-                            request_logger.log_request_response(
-                                operation_id=operation_id,
-                                request_method=method,
-                                request_url=url,
-                                response_status_code=resp.status,
-                                response_headers=dict(resp.headers),
-                                response_content=body,
-                                error_message=_friendly_http_message(resp.status, body),
-                            )
-                        except Exception as _log_e:
-                            logging.debug("[DEBUG] response logging failed: %s", _log_e)
-
-                        await sleep_with_interrupt(
-                            delay,
-                            cfg.node_cls,
-                            cfg.wait_label if cfg.monitor_progress else None,
-                            start_time if cfg.monitor_progress else None,
-                            cfg.estimated_total,
-                            display_callback=_display_time_progress if cfg.monitor_progress else None,
-                        )
-                        delay *= cfg.retry_backoff
-                        continue
-                    msg = _friendly_http_message(resp.status, body)
-                    try:
                         request_logger.log_request_response(
                             operation_id=operation_id,
                             request_method=method,
@@ -730,10 +937,26 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                             response_status_code=resp.status,
                             response_headers=dict(resp.headers),
                             response_content=body,
-                            error_message=msg,
+                            error_message=f"HTTP {resp.status} ({retry_label}, will retry in {wait_time:.1f}s)",
                         )
-                    except Exception as _log_e:
-                        logging.debug("[DEBUG] response logging failed: %s", _log_e)
+                        await sleep_with_interrupt(
+                            wait_time,
+                            cfg.node_cls,
+                            cfg.wait_label if cfg.monitor_progress else None,
+                            start_time if cfg.monitor_progress else None,
+                            display_callback=_display_time_progress if cfg.monitor_progress else None,
+                        )
+                        continue
+                    msg = _friendly_http_message(resp.status, body)
+                    request_logger.log_request_response(
+                        operation_id=operation_id,
+                        request_method=method,
+                        request_url=url,
+                        response_status_code=resp.status,
+                        response_headers=dict(resp.headers),
+                        response_content=body,
+                        error_message=msg,
+                    )
                     raise Exception(msg)
 
                 if expect_binary:
@@ -747,23 +970,27 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                             if is_processing_interrupted():
                                 raise ProcessingInterrupted("Task cancelled")
                             if cfg.monitor_progress:
-                                _display_time_progress(
-                                    cfg.node_cls, cfg.wait_label, int(now - start_time), cfg.estimated_total
-                                )
+                                _display_time_progress(cfg.node_cls, cfg.wait_label, int(now - start_time))
                     bytes_payload = bytes(buff)
+                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                    if is_comfy_api_request:
+                        _maybe_remember_credits_used(cfg.node_cls, resp.headers.get(PRICE_CREDITS_HEADER))
+                        _maybe_remember_server_estimate(cfg.node_cls, resp.headers)
+                    if cfg.price_extractor:
+                        with contextlib.suppress(Exception):
+                            extracted_price = cfg.price_extractor(resp_headers)
+                    if cfg.response_header_validator:
+                        cfg.response_header_validator(resp_headers)
                     operation_succeeded = True
                     final_elapsed_seconds = int(time.monotonic() - start_time)
-                    try:
-                        request_logger.log_request_response(
-                            operation_id=operation_id,
-                            request_method=method,
-                            request_url=url,
-                            response_status_code=resp.status,
-                            response_headers=dict(resp.headers),
-                            response_content=bytes_payload,
-                        )
-                    except Exception as _log_e:
-                        logging.debug("[DEBUG] response logging failed: %s", _log_e)
+                    request_logger.log_request_response(
+                        operation_id=operation_id,
+                        request_method=method,
+                        request_url=url,
+                        response_status_code=resp.status,
+                        response_headers=resp_headers,
+                        response_content=bytes_payload,
+                    )
                     return bytes_payload
                 else:
                     try:
@@ -776,78 +1003,37 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                         except json.JSONDecodeError:
                             payload = {"_raw": text}
                         response_content_to_log = payload if isinstance(payload, dict) else text
+                    if is_comfy_api_request:
+                        _maybe_remember_credits_used(cfg.node_cls, resp.headers.get(PRICE_CREDITS_HEADER))
+                        _maybe_remember_server_estimate(cfg.node_cls, resp.headers)
                     with contextlib.suppress(Exception):
                         extracted_price = cfg.price_extractor(payload) if cfg.price_extractor else None
                     operation_succeeded = True
                     final_elapsed_seconds = int(time.monotonic() - start_time)
-                    try:
-                        request_logger.log_request_response(
-                            operation_id=operation_id,
-                            request_method=method,
-                            request_url=url,
-                            response_status_code=resp.status,
-                            response_headers=dict(resp.headers),
-                            response_content=response_content_to_log,
-                        )
-                    except Exception as _log_e:
-                        logging.debug("[DEBUG] response logging failed: %s", _log_e)
+                    request_logger.log_request_response(
+                        operation_id=operation_id,
+                        request_method=method,
+                        request_url=url,
+                        response_status_code=resp.status,
+                        response_headers=dict(resp.headers),
+                        response_content=response_content_to_log,
+                    )
                     return payload
 
         except ProcessingInterrupted:
             logging.debug("Polling was interrupted by user")
             raise
         except (ClientError, OSError) as e:
-            if attempt <= cfg.max_retries:
+            if (attempt - rate_limit_attempts) <= cfg.max_retries:
                 logging.warning(
                     "Connection error calling %s %s. Retrying in %.2fs (%d/%d): %s",
                     method,
                     url,
                     delay,
-                    attempt,
+                    attempt - rate_limit_attempts,
                     cfg.max_retries,
                     str(e),
                 )
-                try:
-                    request_logger.log_request_response(
-                        operation_id=operation_id,
-                        request_method=method,
-                        request_url=url,
-                        request_headers=dict(payload_headers) if payload_headers else None,
-                        request_params=dict(params) if params else None,
-                        request_data=request_body_log,
-                        error_message=f"{type(e).__name__}: {str(e)} (will retry)",
-                    )
-                except Exception as _log_e:
-                    logging.debug("[DEBUG] request error logging failed: %s", _log_e)
-                await sleep_with_interrupt(
-                    delay,
-                    cfg.node_cls,
-                    cfg.wait_label if cfg.monitor_progress else None,
-                    start_time if cfg.monitor_progress else None,
-                    cfg.estimated_total,
-                    display_callback=_display_time_progress if cfg.monitor_progress else None,
-                )
-                delay *= cfg.retry_backoff
-                continue
-            diag = await _diagnose_connectivity()
-            if not diag["internet_accessible"]:
-                try:
-                    request_logger.log_request_response(
-                        operation_id=operation_id,
-                        request_method=method,
-                        request_url=url,
-                        request_headers=dict(payload_headers) if payload_headers else None,
-                        request_params=dict(params) if params else None,
-                        request_data=request_body_log,
-                        error_message=f"LocalNetworkError: {str(e)}",
-                    )
-                except Exception as _log_e:
-                    logging.debug("[DEBUG] final error logging failed: %s", _log_e)
-                raise LocalNetworkError(
-                    "Unable to connect to the API server due to local network issues. "
-                    "Please check your internet connection and try again."
-                ) from e
-            try:
                 request_logger.log_request_response(
                     operation_id=operation_id,
                     request_method=method,
@@ -855,10 +1041,41 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                     request_headers=dict(payload_headers) if payload_headers else None,
                     request_params=dict(params) if params else None,
                     request_data=request_body_log,
-                    error_message=f"ApiServerError: {str(e)}",
+                    error_message=f"{type(e).__name__}: {str(e)} (will retry)",
                 )
-            except Exception as _log_e:
-                logging.debug("[DEBUG] final error logging failed: %s", _log_e)
+                await sleep_with_interrupt(
+                    delay,
+                    cfg.node_cls,
+                    cfg.wait_label if cfg.monitor_progress else None,
+                    start_time if cfg.monitor_progress else None,
+                    display_callback=_display_time_progress if cfg.monitor_progress else None,
+                )
+                delay *= cfg.retry_backoff
+                continue
+            diag = await _diagnose_connectivity()
+            if not diag["internet_accessible"]:
+                request_logger.log_request_response(
+                    operation_id=operation_id,
+                    request_method=method,
+                    request_url=url,
+                    request_headers=dict(payload_headers) if payload_headers else None,
+                    request_params=dict(params) if params else None,
+                    request_data=request_body_log,
+                    error_message=f"LocalNetworkError: {str(e)}",
+                )
+                raise LocalNetworkError(
+                    "Unable to connect to the API server due to local network issues. "
+                    "Please check your internet connection and try again."
+                ) from e
+            request_logger.log_request_response(
+                operation_id=operation_id,
+                request_method=method,
+                request_url=url,
+                request_headers=dict(payload_headers) if payload_headers else None,
+                request_params=dict(params) if params else None,
+                request_data=request_body_log,
+                error_message=f"ApiServerError: {str(e)}",
+            )
             raise ApiServerError(
                 f"The API server at {default_base_url()} is currently unreachable. "
                 f"The service may be experiencing issues."
@@ -881,7 +1098,7 @@ async def _request_base(cfg: _RequestConfig, expect_binary: bool):
                         if final_elapsed_seconds is not None
                         else int(time.monotonic() - start_time)
                     ),
-                    estimated_total=cfg.estimated_total,
+                    estimated_total=None,
                     price=extracted_price,
                     is_queued=False,
                     processing_elapsed_seconds=final_elapsed_seconds,
